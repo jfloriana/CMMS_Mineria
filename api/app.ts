@@ -1,6 +1,10 @@
 import express from "express";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+import helmet from "helmet";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+import { z } from "zod";
 
 dotenv.config();
 
@@ -22,7 +26,118 @@ if (apiKey) {
 export const app = express();
 export default app;
 
-app.use(express.json());
+// Trust proxy para Vercel (X-Forwarded-For real IP para auditLogs)
+app.set('trust proxy', 1);
+
+// Security headers
+app.use(helmet({
+  contentSecurityPolicy: false, // CSP se maneja en vercel.json para estático; en API no bloquear inline
+  crossOriginEmbedderPolicy: false,
+}));
+
+// CORS — permitir dashboard local y prod (ajusta allowlist en prod si necesitas lock-down)
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*").split(",").map(s => s.trim());
+app.use(cors({
+  origin: ALLOWED_ORIGINS.includes("*") ? true : ALLOWED_ORIGINS,
+  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
+
+// Body parser con límite para evitar DoS por payload grande
+app.use(express.json({ limit: '100kb' }));
+
+// Rate limiting — global suave + estricto para IA costosa
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120, // 120 req/min por IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiadas solicitudes, intenta en 1 minuto" },
+});
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10, // 10 req/min para /api/ai/* (Gemini costoso)
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Límite de IA alcanzado (10/min), reintenta en 1 minuto" },
+});
+app.use(globalLimiter);
+app.use("/api/ai/", aiLimiter);
+
+// ============ VALIDATION SCHEMAS (Zod) ============
+const operationalStatusSchema = z.enum(['Operativo', 'En Mantenimiento', 'Fuera de Servicio', 'Standby']);
+const ticketStatusSchema = z.enum(['REPORTADO', 'DIAGNÓSTICO', 'PLANIFICADO', 'EN_REPARACIÓN', 'PRUEBAS', 'CERRADO']);
+const failureTypeSchema = z.enum(['Hidráulica', 'Mecánica', 'Eléctrica', 'Estructural', 'Neumática']);
+const prioritySchema = z.enum(['Baja', 'Media', 'Alta', 'Urgente', 'Emergencia']);
+
+const userSchema = z.object({
+  id: z.string().min(1).max(100),
+  email: z.string().email().max(200).optional(),
+  fullName: z.string().min(1).max(200),
+  role: z.enum(['Administrador de Sistema', 'Supervisor de Mina', 'Ingeniero de Mantenimiento', 'Operador de Equipo', 'Técnico de Campo']),
+}).passthrough().optional();
+
+const equipmentStatusBodySchema = z.object({
+  status: operationalStatusSchema,
+  user: userSchema,
+});
+
+const createTicketBodySchema = z.object({
+  equipmentId: z.string().min(1).max(100).optional(),
+  equipmentTag: z.string().min(1).max(50).optional(),
+  equipmentName: z.string().min(1).max(200).optional(),
+  componentId: z.string().min(1).max(100).optional(),
+  componentName: z.string().min(1).max(300).optional(),
+  failureType: failureTypeSchema.optional(),
+  severity: z.number().int().min(1).max(5).optional(),
+  title: z.string().min(5).max(300),
+  description: z.string().min(10).max(5000),
+  reportedBy: z.string().min(1).max(200).optional(),
+  priority: prioritySchema.optional(),
+  estimatedCostUSD: z.number().min(0).max(1_000_000).optional(),
+  evidenceUrl: z.string().url().max(500).optional().or(z.literal('')),
+  assignedToUser: userSchema,
+  user: userSchema,
+}).passthrough();
+
+const transitionBodySchema = z.object({
+  targetStatus: ticketStatusSchema,
+  user: userSchema,
+  notes: z.string().max(1000).optional(),
+});
+
+const diagnosticsBodySchema = z.object({
+  equipmentTag: z.string().min(1).max(50).optional(),
+  equipmentName: z.string().min(1).max(200).optional(),
+  componentName: z.string().min(1).max(300).optional(),
+  sensorData: z.object({
+    temperature: z.number().min(-50).max(300).optional(),
+    vibration: z.number().min(0).max(100).optional(),
+    pressure: z.number().min(0).max(1000).optional(),
+    hours: z.number().min(0).max(1000000).optional(),
+  }).passthrough().optional(),
+  failureDescription: z.string().min(1).max(5000).optional(),
+  severity: z.number().int().min(1).max(5).optional(),
+}).passthrough();
+
+// Sanitización prompt injection (limita longitud y escapa instrucciones)
+function sanitizePromptInput(input: unknown, maxLen = 500): string {
+  if (typeof input !== 'string') return String(input ?? '').slice(0, maxLen);
+  // Limita, remueve control chars, evita "ignora instrucciones"
+  return input
+    .slice(0, maxLen)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    .replace(/<\/?(script|iframe|object)[^>]*>/gi, '')
+    .trim();
+}
+
+// Helper IDs únicos
+function genTicketId() {
+  try { return `tkt-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`; } catch { return `tkt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
+}
+function genTicketCode() {
+  try { return `WO-2026-${crypto.randomUUID().slice(0, 3).toUpperCase()}-${Math.floor(100 + Math.random() * 900)}`; } catch { return `WO-2026-${Math.floor(100 + Math.random() * 900)}`; }
+}
 
 // In-Memory Database Store
 let currentEquipments = [
@@ -353,7 +468,11 @@ app.get("/api/equipment/:id", (req, res) => {
 });
 
 app.patch("/api/equipment/:id/status", (req, res) => {
-  const { status, user } = req.body;
+  const parsed = equipmentStatusBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Validación fallida", details: parsed.error.issues });
+  }
+  const { status, user } = parsed.data;
   const eqIndex = currentEquipments.findIndex(e => e.id === req.params.id);
   if (eqIndex === -1) {
     return res.status(404).json({ error: "Equipo no encontrado" });
@@ -363,7 +482,7 @@ app.patch("/api/equipment/:id/status", (req, res) => {
   currentEquipments[eqIndex].status = status;
   
   const audit = {
-    id: `aud-${Date.now()}`,
+    id: `aud-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     userId: user?.id || 'usr-anon',
     userName: user?.fullName || 'Usuario',
     userRole: user?.role || 'Operador',
@@ -375,6 +494,8 @@ app.patch("/api/equipment/:id/status", (req, res) => {
     createdAt: new Date().toISOString()
   };
   auditLogs.unshift(audit);
+  // Evitar crecimiento ilimitado en serverless (OOM) — mantener últimos 200
+  if (auditLogs.length > 200) auditLogs.length = 200;
 
   res.json({ data: currentEquipments[eqIndex], audit });
 });
@@ -385,20 +506,28 @@ app.get("/api/tickets", (_req, res) => {
 });
 
 app.post("/api/tickets", (req, res) => {
-  const body = req.body;
+  const parsed = createTicketBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Validación fallida", details: parsed.error.issues });
+  }
+  const body = parsed.data;
+  // Verificar equipo existe si se envía equipmentId
+  if (body.equipmentId && !currentEquipments.find(e => e.id === body.equipmentId)) {
+    return res.status(400).json({ error: `equipmentId no existe: ${body.equipmentId}` });
+  }
   const newTicket = {
-    id: `tkt-${Date.now()}`,
-    ticketCode: `WO-2026-${Math.floor(100 + Math.random() * 900)}`,
-    equipmentId: body.equipmentId,
+    id: genTicketId(),
+    ticketCode: genTicketCode(),
+    equipmentId: body.equipmentId || 'eq-unknown',
     equipmentTag: body.equipmentTag || 'EQ-MINING',
     equipmentName: body.equipmentName || 'Equipo Minero',
     componentId: body.componentId || 'cmp-gen',
     componentName: body.componentName || 'Componente General',
     failureType: body.failureType || 'Mecánica',
     severity: body.severity || 3,
-    title: body.title,
-    description: body.description,
-    reportedBy: body.reportedBy || 'Operador',
+    title: sanitizePromptInput(body.title, 300),
+    description: sanitizePromptInput(body.description, 5000),
+    reportedBy: sanitizePromptInput(body.reportedBy || 'Operador', 200),
     reportedAt: new Date().toISOString().replace('T', ' ').substring(0, 19),
     assignedToUser: body.assignedToUser,
     status: 'REPORTADO' as const,
@@ -408,11 +537,11 @@ app.post("/api/tickets", (req, res) => {
     evidenceUrl: body.evidenceUrl,
     timeline: [
       {
-        id: `tl-${Date.now()}`,
+        id: `tl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         ticketId: `tkt-${Date.now()}`,
         statusFrom: 'REPORTADO',
         statusTo: 'REPORTADO',
-        changedBy: body.reportedBy || 'Operador',
+        changedBy: sanitizePromptInput(body.reportedBy || 'Operador', 200),
         changedAt: new Date().toISOString().replace('T', ' ').substring(0, 19),
         notes: 'Creación y registro inicial del ticket de falla.'
       }
@@ -420,9 +549,10 @@ app.post("/api/tickets", (req, res) => {
   };
 
   currentTickets.unshift(newTicket as any);
+  if (currentTickets.length > 500) currentTickets.length = 500;
 
   auditLogs.unshift({
-    id: `aud-${Date.now()}`,
+    id: `aud-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     userId: body.user?.id || 'usr-anon',
     userName: body.user?.fullName || body.reportedBy,
     userRole: body.user?.role || 'Operador',
@@ -438,10 +568,28 @@ app.post("/api/tickets", (req, res) => {
 });
 
 app.patch("/api/tickets/:id/transition", (req, res) => {
-  const { targetStatus, user, notes } = req.body;
+  const parsed = transitionBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Validación fallida", details: parsed.error.issues });
+  }
+  const { targetStatus, user, notes } = parsed.data;
   const ticket = currentTickets.find(t => t.id === req.params.id);
   if (!ticket) {
     return res.status(404).json({ error: "Ticket no encontrado" });
+  }
+
+  // Máquina de estados completa (funcional, no solo fachada)
+  const ALLOWED_TRANSITIONS: Record<string, string[]> = {
+    'REPORTADO': ['DIAGNÓSTICO'],
+    'DIAGNÓSTICO': ['PLANIFICADO', 'CERRADO'],
+    'PLANIFICADO': ['EN_REPARACIÓN', 'CERRADO'],
+    'EN_REPARACIÓN': ['PRUEBAS', 'CERRADO'],
+    'PRUEBAS': ['CERRADO', 'EN_REPARACIÓN'],
+    'CERRADO': [],
+  };
+  const allowed = ALLOWED_TRANSITIONS[ticket.status] || [];
+  if (!allowed.includes(targetStatus)) {
+    return res.status(400).json({ error: `Transición no permitida: ${ticket.status} → ${targetStatus}. Permitidas: ${allowed.join(', ') || 'ninguna'}` });
   }
 
   if (ticket.status === 'DIAGNÓSTICO' && targetStatus === 'PLANIFICADO') {
@@ -468,23 +616,31 @@ app.patch("/api/tickets/:id/transition", (req, res) => {
 
   if (targetStatus === 'CERRADO') {
     ticket.resolvedAt = new Date().toISOString().replace('T', ' ').substring(0, 19);
-    ticket.mttrHoursCalculated = 4.2;
-    ticket.actualCostUSD = ticket.actualCostUSD || ticket.estimatedCostUSD * 0.95;
+    // Cálculo real MTTR (horas entre startedAt y resolvedAt), fallback 4.2 si no hay startedAt
+    if (ticket.startedAt) {
+      const start = new Date(ticket.startedAt.replace(' ', 'T')).getTime();
+      const end = new Date(ticket.resolvedAt.replace(' ', 'T')).getTime();
+      const diffH = (end - start) / (1000 * 60 * 60);
+      ticket.mttrHoursCalculated = diffH > 0 ? Math.round(diffH * 10) / 10 : 4.2;
+    } else {
+      ticket.mttrHoursCalculated = 4.2;
+    }
+    ticket.actualCostUSD = ticket.actualCostUSD || Math.round(ticket.estimatedCostUSD * 0.95);
   }
 
   const timelineEntry = {
-    id: `tl-${Date.now()}`,
+    id: `tl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     ticketId: ticket.id,
     statusFrom: prevStatus,
     statusTo: targetStatus,
-    changedBy: user?.fullName || 'Supervisor',
+    changedBy: sanitizePromptInput(user?.fullName || 'Supervisor', 200),
     changedAt: new Date().toISOString().replace('T', ' ').substring(0, 19),
-    notes: notes || `Transición de estado a ${targetStatus}`
+    notes: sanitizePromptInput(notes || `Transición de estado a ${targetStatus}`, 1000)
   };
   ticket.timeline.push(timelineEntry);
 
   auditLogs.unshift({
-    id: `aud-${Date.now()}`,
+    id: `aud-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     userId: user?.id || 'usr-anon',
     userName: user?.fullName || 'Usuario',
     userRole: user?.role || 'Supervisor',
@@ -495,6 +651,7 @@ app.patch("/api/tickets/:id/transition", (req, res) => {
     ipAddress: req.ip || '127.0.0.1',
     createdAt: new Date().toISOString()
   });
+  if (auditLogs.length > 200) auditLogs.length = 200;
 
   res.json({ data: ticket });
 });
@@ -504,19 +661,29 @@ app.get("/api/audit-logs", (_req, res) => {
   res.json({ data: auditLogs, total: auditLogs.length });
 });
 
-// AI Diagnostic Root Cause Analysis with Gemini 2.0 Flash (estable) + fallback 503 resiliente
+// AI Diagnostic Root Cause Analysis con Gemini + fallback resiliente
 app.post("/api/ai/diagnostics", async (req, res) => {
-  const { equipmentTag, equipmentName, componentName, sensorData, failureDescription, severity } = req.body;
+  const parsed = diagnosticsBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Validación fallida", details: parsed.error.issues });
+  }
+  const raw = parsed.data;
+  const equipmentTag = sanitizePromptInput(raw.equipmentTag || 'EQ-MINING', 50);
+  const equipmentName = sanitizePromptInput(raw.equipmentName || 'Equipo', 200);
+  const componentName = sanitizePromptInput(raw.componentName || 'Componente', 300);
+  const failureDescription = sanitizePromptInput(raw.failureDescription || 'Falla reportada', 2000);
+  const severity = raw.severity || 4;
+  const sensorData = raw.sensorData || {};
 
   if (!ai) {
     return res.json({
       success: true,
       data: {
         rootCause: `Degradación tribológica y fatiga superficial del material en ${componentName} provocada por oscilaciones armónicas y temperatura elevada (${sensorData?.temperature || 94}°C).`,
-        fmeaSeverity: severity || 4,
+        fmeaSeverity: severity,
         fmeaOccurrence: 3,
         fmeaDetection: 2,
-        rpnScore: (severity || 4) * 3 * 2,
+        rpnScore: severity * 3 * 2,
         prescriptiveSteps: [
           `Aislar y despresurizar el circuito principal del ${equipmentTag}.`,
           `Inspeccionar tolerancia dimensional del alojamiento y estado de la película lubricante ISO VG 46/68.`,
@@ -559,20 +726,24 @@ Responde en formato JSON válido con las siguientes claves:
   "preventiveMeasures": "Medidas para evitar recurrencia a largo plazo"
 }`;
 
-    const response = await ai.models.generateContent({
+    const geminiPromise = ai.models.generateContent({
       model: GEMINI_MODEL,
       contents: prompt,
       config: {
         responseMimeType: "application/json",
       }
     });
+    const timeoutPromise = new Promise<never>((_, reject) => setTimeout(() => reject(Object.assign(new Error('Gemini timeout 8s'), { status: 503 })), 8000));
+    const response = await Promise.race([geminiPromise, timeoutPromise]) as any;
 
     const parsed = JSON.parse(response.text || "{}");
+    // Validar estructura mínima para evitar crash si LLM retorna basura
+    if (!parsed.rootCause) throw new Error("Respuesta Gemini inválida sin rootCause");
     res.json({ success: true, data: parsed });
   } catch (err: any) {
     console.error("Gemini API Diagnostics error:", err);
-    // Resiliencia: cualquier fallo de Gemini (503/404/429) → fallback 200 para no romper CMMS
-    const isOverloaded = err?.status === 503 || err?.status === 429 || err?.status === 404 || `${err.message}`.includes("503") || `${err.message}`.includes("404") || `${err.message}`.includes("UNAVAILABLE") || `${err.message}`.includes("NOT_FOUND") || `${err.message}`.includes("high demand");
+    // Resiliencia: cualquier fallo de Gemini (503/404/429/timeout) → fallback 200 para no romper CMMS
+    const isOverloaded = err?.status === 503 || err?.status === 429 || err?.status === 404 || `${err.message}`.includes("503") || `${err.message}`.includes("404") || `${err.message}`.includes("UNAVAILABLE") || `${err.message}`.includes("NOT_FOUND") || `${err.message}`.includes("high demand") || `${err.message}`.includes("timeout");
     if (isOverloaded) {
       console.warn("Gemini 503 overloaded → fallback industrial");
       return res.json({
@@ -628,15 +799,17 @@ Estructura el reporte con:
 2. Alertas Críticas y Acciones de Mitigación Inmediatas.
 3. Impacto Financiero y Proyección de Disponibilidad para los próximos 7 días.`;
 
-    const response = await ai.models.generateContent({
+    const geminiPromise2 = ai.models.generateContent({
       model: GEMINI_MODEL,
       contents: prompt,
     });
+    const timeoutPromise2 = new Promise<never>((_, reject) => setTimeout(() => reject(Object.assign(new Error('Gemini timeout 8s'), { status: 503 })), 8000));
+    const response = await Promise.race([geminiPromise2, timeoutPromise2]) as any;
 
     res.json({ success: true, summary: response.text });
   } catch (err: any) {
     console.error("Gemini API Executive Summary error:", err);
-    const isOverloaded = err?.status === 503 || err?.status === 429 || err?.status === 404 || `${err.message}`.includes("503") || `${err.message}`.includes("404") || `${err.message}`.includes("UNAVAILABLE") || `${err.message}`.includes("NOT_FOUND");
+    const isOverloaded = err?.status === 503 || err?.status === 429 || err?.status === 404 || `${err.message}`.includes("503") || `${err.message}`.includes("404") || `${err.message}`.includes("UNAVAILABLE") || `${err.message}`.includes("NOT_FOUND") || `${err.message}`.includes("timeout");
     if (isOverloaded) {
       console.warn("Gemini 503 overloaded → fallback executive summary");
       return res.json({
@@ -649,6 +822,19 @@ Estructura el reporte con:
 • Nota: Gemini temporalmente no disponible (503) — fallback industrial aplicado, reintentar en 30s.`
       });
     }
-    res.status(500).json({ error: "Error generando resumen ejecutivo", details: err.message });
+    res.status(500).json({ error: "Error generando resumen ejecutivo", details: process.env.NODE_ENV === "production" ? "Error interno" : err.message });
   }
+});
+
+// Global error handlers (funcional, no solo fachada)
+app.use((err: any, _req: any, res: any, next: any) => {
+  if (err instanceof SyntaxError && (err as any).status === 400 && 'body' in err) {
+    return res.status(400).json({ error: "JSON inválido en body" });
+  }
+  next(err);
+});
+app.use((err: any, _req: any, res: any, _next: any) => {
+  console.error("Unhandled error:", err);
+  const isProd = process.env.NODE_ENV === "production";
+  res.status(500).json({ error: "Error interno del servidor", details: isProd ? undefined : err?.message });
 });

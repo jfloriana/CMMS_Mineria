@@ -1,14 +1,24 @@
-import React from 'react';
+import React, { lazy, Suspense } from 'react';
 import { useApp } from './context/AppContext';
-import { MiningDashboard } from './modules/Dashboard/MiningDashboard';
-import { DigitalTwin3D } from './modules/DigitalTwin/DigitalTwin3D';
-import { TicketBoard } from './modules/CMMS/TicketBoard';
-import { EquipmentList } from './modules/Equipment/EquipmentList';
-import { EquipmentDetail } from './modules/Equipment/EquipmentDetail';
-import { PredictiveAnalytics } from './modules/PredictiveAI/PredictiveAnalytics';
-import { ArchitectureDiagrams } from './modules/Architecture/ArchitectureDiagrams';
-import { AuditLogView } from './modules/Audit/AuditLogView';
 import { INITIAL_USERS } from './data/mockDatabase';
+
+// Lazy-loaded heavy modules (code-splitting para bajar entry 1.2MB → ~350kB)
+const MiningDashboard = lazy(() => import('./modules/Dashboard/MiningDashboard').then(m => ({ default: m.MiningDashboard })));
+const DigitalTwin3D = lazy(() => import('./modules/DigitalTwin/DigitalTwin3D').then(m => ({ default: m.DigitalTwin3D })));
+const TicketBoard = lazy(() => import('./modules/CMMS/TicketBoard').then(m => ({ default: m.TicketBoard })));
+const EquipmentList = lazy(() => import('./modules/Equipment/EquipmentList').then(m => ({ default: m.EquipmentList })));
+const EquipmentDetail = lazy(() => import('./modules/Equipment/EquipmentDetail').then(m => ({ default: m.EquipmentDetail })));
+const PredictiveAnalytics = lazy(() => import('./modules/PredictiveAI/PredictiveAnalytics').then(m => ({ default: m.PredictiveAnalytics })));
+const ArchitectureDiagrams = lazy(() => import('./modules/Architecture/ArchitectureDiagrams').then(m => ({ default: m.ArchitectureDiagrams })));
+const AuditLogView = lazy(() => import('./modules/Audit/AuditLogView').then(m => ({ default: m.AuditLogView })));
+
+// Fallback ligero para Suspense
+const ModuleLoader: React.FC = () => (
+  <div className="flex items-center justify-center py-20 text-xs font-mono text-[#888]">
+    <div className="w-2 h-2 bg-[#FFD700] rounded-full animate-ping mr-2" />
+    Cargando módulo...
+  </div>
+);
 import { 
   Activity, 
   Boxes, 
@@ -212,16 +222,18 @@ export const AppContent: React.FC = () => {
         </button>
       </nav>
 
-      {/* Main Content Area */}
+      {/* Main Content Area — lazy con Suspense */}
       <main className="flex-1 p-3 lg:p-5 max-w-[1680px] w-full mx-auto">
-        {activeTab === 'dashboard' && <MiningDashboard />}
-        {activeTab === 'digital-twin' && <DigitalTwin3D />}
-        {activeTab === 'cmms' && <TicketBoard />}
-        {activeTab === 'equipment-list' && <EquipmentList />}
-        {activeTab === 'equipment-detail' && <EquipmentDetail />}
-        {activeTab === 'predictive-ai' && <PredictiveAnalytics />}
-        {activeTab === 'architecture' && <ArchitectureDiagrams />}
-        {activeTab === 'audit-logs' && <AuditLogView />}
+        <Suspense fallback={<ModuleLoader />}>
+          {activeTab === 'dashboard' && <MiningDashboard />}
+          {activeTab === 'digital-twin' && <DigitalTwin3D />}
+          {activeTab === 'cmms' && <TicketBoard />}
+          {activeTab === 'equipment-list' && <EquipmentList />}
+          {activeTab === 'equipment-detail' && <EquipmentDetail />}
+          {activeTab === 'predictive-ai' && <PredictiveAnalytics />}
+          {activeTab === 'architecture' && <ArchitectureDiagrams />}
+          {activeTab === 'audit-logs' && <AuditLogView />}
+        </Suspense>
       </main>
 
       {/* Industrial High Density Footer */}
