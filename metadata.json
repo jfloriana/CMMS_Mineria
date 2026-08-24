@@ -1,0 +1,6 @@
+{
+  "name": "MineTwin AI - Mining Equipment Digital Twin & Predictive CMMS",
+  "description": "Enterprise predictive maintenance, 3D Digital Twin, RUL ML models, and CMMS work orders for open-pit mining heavy machinery (P&H 4100XPC, Cat 797F, Komatsu 980E).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
