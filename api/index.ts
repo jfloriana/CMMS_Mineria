@@ -1,4 +1,4 @@
-import app from "../server";
+import app from "./app.js";
 
 // Vercel Serverless Function handler - delega todo a Express
 // Todas las rutas /api/* llegan aquí vía vercel.json rewrite
