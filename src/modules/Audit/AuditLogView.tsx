@@ -7,15 +7,31 @@ export const AuditLogView: React.FC = () => {
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [filterAction, setFilterAction] = useState<string>('all');
 
-  const filteredLogs = auditLogs.filter(log => {
+  // Normaliza AuditLog para soportar tanto shape de API (resource/createdAt/userName) como legacy (entityType/timestamp/userFullName)
+  const getLogField = (log: any, ...keys: string[]) => {
+    for (const k of keys) if (log[k] != null) return log[k];
+    return undefined;
+  };
+
+  const filteredLogs = (auditLogs || []).filter(log => {
+    if (!log) return false;
     if (filterAction !== 'all' && log.action !== filterAction) return false;
     if (searchTerm) {
       const q = searchTerm.toLowerCase();
+      const entityType = String(getLogField(log, 'entityType', 'resource', 'resourceId') || '').toLowerCase();
+      const userName = String(getLogField(log, 'userFullName', 'userName') || '').toLowerCase();
+      const userRole = String(getLogField(log, 'userRole') || '').toLowerCase();
+      const detailsStr = (() => {
+        const d = getLogField(log, 'details');
+        if (!d) return '';
+        if (typeof d === 'string') return d.toLowerCase();
+        try { return JSON.stringify(d).toLowerCase(); } catch { return ''; }
+      })();
       return (
-        log.entityType.toLowerCase().includes(q) ||
-        log.userFullName.toLowerCase().includes(q) ||
-        log.userRole.toLowerCase().includes(q) ||
-        (log.details && log.details.toLowerCase().includes(q))
+        entityType.includes(q) ||
+        userName.includes(q) ||
+        userRole.includes(q) ||
+        detailsStr.includes(q)
       );
     }
     return true;
@@ -93,34 +109,58 @@ export const AuditLogView: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-[#2A2A2A] text-[#D1D1D1]">
-              {filteredLogs.map(log => (
+              {filteredLogs.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="p-8 text-center text-[#666] font-mono text-xs">
+                    Sin registros que coincidan con el filtro
+                  </td>
+                </tr>
+              ) : filteredLogs.map(log => {
+                const timestamp = getLogField(log, 'timestamp', 'createdAt');
+                const userFullName = getLogField(log, 'userFullName', 'userName');
+                const entityType = getLogField(log, 'entityType', 'resource');
+                const previousState = getLogField(log, 'previousState', 'details')?.from ?? getLogField(log, 'previousState');
+                const newState = getLogField(log, 'newState', 'details')?.to ?? getLogField(log, 'newState');
+                // details puede ser objeto (API) o string (legacy)
+                const detailsRaw = getLogField(log, 'details');
+                const detailsStr = typeof detailsRaw === 'string' ? detailsRaw : detailsRaw ? JSON.stringify(detailsRaw) : '';
+                // Timestamp formateado seguro
+                const tsDisplay = (() => {
+                  if (!timestamp) return '—';
+                  try {
+                    const d = new Date(timestamp);
+                    return isNaN(d.getTime()) ? String(timestamp).slice(0, 19) : d.toLocaleString('es-PE');
+                  } catch { return String(timestamp).slice(0, 19); }
+                })();
+                return (
                 <tr key={log.id} className="hover:bg-[#111] transition-colors">
                   <td className="p-3 font-mono text-[#888] text-[10px] whitespace-nowrap">
-                    {log.timestamp}
+                    {tsDisplay}
                   </td>
                   <td className="p-3">
-                    <div className="font-semibold text-white text-xs">{log.userFullName}</div>
-                    <div className="text-[9px] text-[#FFD700] font-mono">{log.userRole}</div>
+                    <div className="font-semibold text-white text-xs">{userFullName || '—'}</div>
+                    <div className="text-[9px] text-[#FFD700] font-mono">{log.userRole || '—'}</div>
                   </td>
                   <td className="p-3">
                     <span className="px-1.5 py-0.2 rounded text-[9px] font-mono font-bold bg-[#1A1A1A] text-[#D1D1D1] border border-[#2A2A2A]">
-                      {log.action}
+                      {log.action || '—'}
                     </span>
                   </td>
                   <td className="p-3 font-semibold text-white">
-                    {log.entityType}
+                    {entityType || log.resourceId || '—'}
                   </td>
                   <td className="p-3 text-[#888] font-mono text-[10px]">
-                    {log.previousState ? JSON.stringify(log.previousState) : '—'}
+                    {previousState ? (typeof previousState === 'string' ? previousState : JSON.stringify(previousState)) : '—'}
                   </td>
                   <td className="p-3 text-emerald-400 font-mono font-semibold text-[10px]">
-                    {log.newState ? JSON.stringify(log.newState) : '—'}
+                    {newState ? (typeof newState === 'string' ? newState : JSON.stringify(newState)) : '—'}
                   </td>
-                  <td className="p-3 text-[#888] max-w-xs truncate text-[10px]">
-                    {log.details || 'Operación registrada en sistema'}
+                  <td className="p-3 text-[#888] max-w-xs truncate text-[10px]" title={detailsStr}>
+                    {detailsStr || 'Operación registrada en sistema'}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
