@@ -559,7 +559,7 @@ Responde en formato JSON válido con las siguientes claves:
 }`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
+      model: "gemini-1.5-flash",
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -570,8 +570,8 @@ Responde en formato JSON válido con las siguientes claves:
     res.json({ success: true, data: parsed });
   } catch (err: any) {
     console.error("Gemini API Diagnostics error:", err);
-    // Resiliencia: si Gemini está sobrecargado (503/429), devolver fallback 200 en vez de 500
-    const isOverloaded = err?.status === 503 || err?.status === 429 || `${err.message}`.includes("503") || `${err.message}`.includes("UNAVAILABLE") || `${err.message}`.includes("high demand");
+    // Resiliencia: cualquier fallo de Gemini (503/404/429) → fallback 200 para no romper CMMS
+    const isOverloaded = err?.status === 503 || err?.status === 429 || err?.status === 404 || `${err.message}`.includes("503") || `${err.message}`.includes("404") || `${err.message}`.includes("UNAVAILABLE") || `${err.message}`.includes("NOT_FOUND") || `${err.message}`.includes("high demand");
     if (isOverloaded) {
       console.warn("Gemini 503 overloaded → fallback industrial");
       return res.json({
@@ -628,14 +628,14 @@ Estructura el reporte con:
 3. Impacto Financiero y Proyección de Disponibilidad para los próximos 7 días.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
+      model: "gemini-1.5-flash",
       contents: prompt,
     });
 
     res.json({ success: true, summary: response.text });
   } catch (err: any) {
     console.error("Gemini API Executive Summary error:", err);
-    const isOverloaded = err?.status === 503 || err?.status === 429 || `${err.message}`.includes("503") || `${err.message}`.includes("UNAVAILABLE");
+    const isOverloaded = err?.status === 503 || err?.status === 429 || err?.status === 404 || `${err.message}`.includes("503") || `${err.message}`.includes("404") || `${err.message}`.includes("UNAVAILABLE") || `${err.message}`.includes("NOT_FOUND");
     if (isOverloaded) {
       console.warn("Gemini 503 overloaded → fallback executive summary");
       return res.json({
