@@ -8,9 +8,18 @@ import { z } from "zod";
 
 dotenv.config();
 
+// Validación env al boot (fail-fast en prod, warn en dev)
+const ALLOWED_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"];
+if (!process.env.VERCEL && !process.env.GEMINI_API_KEY) {
+  console.warn("⚠ GEMINI_API_KEY no configurada — se usará fallback industrial (ver .env.example)");
+}
+if (process.env.GEMINI_MODEL && !ALLOWED_MODELS.includes(process.env.GEMINI_MODEL)) {
+  console.warn(`⚠ GEMINI_MODEL="${process.env.GEMINI_MODEL}" no está en allowlist ${ALLOWED_MODELS.join(", ")} — se usará default gemini-2.5-flash`);
+}
+
 // Initialize Gemini Client
 const apiKey = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash"; // modelos válidos 2025-26: gemini-2.5-flash, gemini-2.5-pro, gemini-3.6-flash (ver https://ai.google.dev/gemini-api/docs/models)
+const GEMINI_MODEL = ALLOWED_MODELS.includes(process.env.GEMINI_MODEL || "") ? process.env.GEMINI_MODEL! : "gemini-2.5-flash";
 let ai: GoogleGenAI | null = null;
 if (apiKey) {
   ai = new GoogleGenAI({
@@ -45,6 +54,22 @@ app.use(cors({
 
 // Body parser con límite para evitar DoS por payload grande
 app.use(express.json({ limit: '100kb' }));
+
+// Request ID + logging estructurado (funcional para trazabilidad en Vercel logs)
+app.use((req: any, res, next) => {
+  const existing = req.headers['x-request-id'] as string | undefined;
+  let id: string;
+  try { id = existing || (globalThis as any).crypto?.randomUUID?.() || `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; } catch { id = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
+  req.requestId = id;
+  res.setHeader('X-Request-Id', id);
+  const start = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    // Log estructurado para Vercel (aparece en vercel logs --expand)
+    console.log(JSON.stringify({ requestId: id, method: req.method, path: req.originalUrl, status: res.statusCode, durationMs: ms, ip: req.ip }));
+  });
+  next();
+});
 
 // Rate limiting — global suave + estricto para IA costosa
 const globalLimiter = rateLimit({
@@ -443,20 +468,48 @@ let auditLogs: Array<any> = [
   }
 ];
 
-// Health endpoint
+// Health endpoint — profundo (verifica memoria, uptime, Gemini)
 app.get("/api/health", (_req, res) => {
+  const mem = process.memoryUsage();
   res.json({
     status: "ok",
     system: "MineTwin AI - Heavy Mining Asset Management",
     version: "3.2.0-prod",
-    uptimeSeconds: process.uptime(),
-    timestamp: new Date().toISOString()
+    uptimeSeconds: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+    checks: {
+      gemini: apiKey ? "configured" : "fallback",
+      geminiModel: GEMINI_MODEL,
+      memory: {
+        heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
+        heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
+        rssMB: Math.round(mem.rss / 1024 / 1024),
+      },
+      data: {
+        equipments: currentEquipments.length,
+        tickets: currentTickets.length,
+        auditLogs: auditLogs.length,
+      }
+    }
   });
 });
 
+// Helpers paginación
+function parsePagination(req: any) {
+  const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 50, 1), 100);
+  const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
+  const page = Math.max(parseInt(req.query.page as string) || 1, 1);
+  // Soporta ?page&limit o ?offset&limit
+  const effectiveOffset = req.query.page ? (page - 1) * limit : offset;
+  return { limit, offset: effectiveOffset, page };
+}
+
 // Equipment endpoints
-app.get("/api/equipment", (_req, res) => {
-  res.json({ data: currentEquipments, total: currentEquipments.length });
+app.get("/api/equipment", (req, res) => {
+  const { limit, offset } = parsePagination(req);
+  const total = currentEquipments.length;
+  const data = currentEquipments.slice(offset, offset + limit);
+  res.json({ data, total, limit, offset, hasMore: offset + limit < total });
 });
 
 app.get("/api/equipment/:id", (req, res) => {
@@ -500,9 +553,17 @@ app.patch("/api/equipment/:id/status", (req, res) => {
   res.json({ data: currentEquipments[eqIndex], audit });
 });
 
-// Tickets CMMS API
-app.get("/api/tickets", (_req, res) => {
-  res.json({ data: currentTickets, total: currentTickets.length });
+// Tickets CMMS API — con paginación y filtros funcionales
+app.get("/api/tickets", (req, res) => {
+  const { limit, offset } = parsePagination(req);
+  let filtered = [...currentTickets];
+  // Filtros opcionales ?status=REPORTADO&equipmentId=eq-ph4100-01&severity=4
+  if (req.query.status) filtered = filtered.filter(t => t.status === req.query.status);
+  if (req.query.equipmentId) filtered = filtered.filter(t => t.equipmentId === req.query.equipmentId);
+  if (req.query.severity) filtered = filtered.filter(t => String(t.severity) === String(req.query.severity));
+  const total = filtered.length;
+  const data = filtered.slice(offset, offset + limit);
+  res.json({ data, total, limit, offset, hasMore: offset + limit < total });
 });
 
 app.post("/api/tickets", (req, res) => {
@@ -656,9 +717,16 @@ app.patch("/api/tickets/:id/transition", (req, res) => {
   res.json({ data: ticket });
 });
 
-// Audit logs endpoint
-app.get("/api/audit-logs", (_req, res) => {
-  res.json({ data: auditLogs, total: auditLogs.length });
+// Audit logs endpoint — paginado y filtrable ?action=TICKET_CREATED&resource=equipment
+app.get("/api/audit-logs", (req, res) => {
+  const { limit, offset } = parsePagination(req);
+  let filtered = [...auditLogs];
+  if (req.query.action) filtered = filtered.filter(l => l.action === req.query.action);
+  if (req.query.resource) filtered = filtered.filter(l => l.resource === req.query.resource);
+  if (req.query.userId) filtered = filtered.filter(l => l.userId === req.query.userId);
+  const total = filtered.length;
+  const data = filtered.slice(offset, offset + limit);
+  res.json({ data, total, limit, offset, hasMore: offset + limit < total });
 });
 
 // AI Diagnostic Root Cause Analysis con Gemini + fallback resiliente
