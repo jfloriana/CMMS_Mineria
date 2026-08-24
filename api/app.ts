@@ -6,6 +6,7 @@ dotenv.config();
 
 // Initialize Gemini Client
 const apiKey = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash"; // modelos válidos 2025-26: gemini-2.5-flash, gemini-2.5-pro, gemini-3.6-flash (ver https://ai.google.dev/gemini-api/docs/models)
 let ai: GoogleGenAI | null = null;
 if (apiKey) {
   ai = new GoogleGenAI({
@@ -559,7 +560,7 @@ Responde en formato JSON válido con las siguientes claves:
 }`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-1.5-flash",
+      model: GEMINI_MODEL,
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -628,7 +629,7 @@ Estructura el reporte con:
 3. Impacto Financiero y Proyección de Disponibilidad para los próximos 7 días.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-1.5-flash",
+      model: GEMINI_MODEL,
       contents: prompt,
     });
 
